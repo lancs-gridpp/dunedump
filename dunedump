@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+#---------------------------------------------------------------------------------
+# Copyright (c) 2026 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+# Usage:
+#    dunedump
+#      [-s,--source-directory /path/to/dump]
+#      [-o <file-name>,--output-dir <file-name>]
+#      [-h]
+#      [-r,--relative]
+#      [-f,--follow-symlinks]
+#      [-O, --owner <fileowner>
+#
+# Walks a directory tree and writes one line per file to an output file, containing
+# the path, file size, and the Adler32 checksum stored in the extended attribute
+# 'user.XrdCks.adler32'. Fields are tab-separated. If a checksum isn't set for a file
+# the field is left blank.
+#
+# The default output file name is dump_YYYYMMDD where YYMMDD is the current date.
+#
+# The default source directory is set using SOURCE_DIR below.  Use the -s option to
+# override it.
+#
+# The default output directory is set using OUTPUT_DIR below.  Use teh -o option to
+# override it.
+#
+# The default owner of the output file is xrootd:xrootd.  fileowner can be specified as
+# <user>:<group> or simply <user>.
+#
+
+import argparse
+import datetime
+import grp
+import os
+import pwd
+import sys
+import tempfile
+
+XATTR_NAME = "user.XrdCks.adler32"
+FILE_OWNER = "xrootd:xrootd"
+OUTPUT_DIR = "/cephfs/grid/dune/dumps"
+SOURCE_DIR = "/cephfs/grid/dune"
+
+
+def chown_file(file, owner):
+    """owner is a string like 'alice' or 'alice:physics'"""
+    if ":" in owner:
+        user, group = owner.split(":", 1)
+    else:
+        user, group = owner, None
+
+    uid = pwd.getpwnam(user).pw_uid if user else -1
+    gid = grp.getgrnam(group).gr_gid if group else -1
+
+    os.chown(file, uid, gid)
+
+
+def outputfile_name():
+    """ Generate the output file name with todays date: dumpYYMMDD """
+    return f"dump_{datetime.date.today().strftime('%Y%m%d')}"
+
+
+def get_checksum(path):
+    """
+    Return the adler32 checksum stored in the xattr, as a hex string,
+    or '' if the attribute is absent/unreadable.
+
+    The xattr value is a fixed-size binary record laid out as:
+        bytes  0-19 : checksum name ("adler32"), null-padded
+        bytes 20-23 : 4-byte timestamp (mtime when checksum was computed)
+        bytes 24-27 : 4-byte field of unknown purpose (seen as 0 and 1)
+        bytes 28-31 : 4-byte big-endian length of the checksum value
+        bytes 32-.. : the checksum bytes themselves (length given above)
+        remainder   : zero padding to fill the fixed record size
+    """
+    try:
+        raw = os.getxattr(path, XATTR_NAME)
+    except OSError:
+        return ""
+
+    try:
+        checksum_len = int.from_bytes(raw[28:32], "big")
+        checksum_bytes = raw[32:32 + checksum_len]
+        if len(checksum_bytes) != checksum_len:
+            raise ValueError("truncated checksum field")
+        return checksum_bytes.hex()
+    except (ValueError, IndexError):
+        return raw.hex()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "List all files under a directory (recursively) with their size "
+            "and adler32 checksum (from the user.XrdCks.adler32 xattr), "
+            "tab-separated, one file per line."
+        )
+    )
+    parser.add_argument(
+        "-s", "--source-directory", default=SOURCE_DIR,
+        help=f"Directory to scan recursively (default = {SOURCE_DIR})")
+    parser.add_argument(
+        "-o", "--output-dir", default=OUTPUT_DIR,
+        help=f"Directory where the output file is written.  (default = {OUTPUT_DIR})",
+    )
+    parser.add_argument(
+        "-r","--relative", action="store_true",
+        help="Write paths relative to the scanned directory instead of absolute paths",
+    )
+    parser.add_argument(
+        "-f","--follow-symlinks", action="store_true",
+        help="Follow symlinked directories while walking (off by default)",
+    )
+    parser.add_argument(
+        "-O", "--owner", default=FILE_OWNER,
+        help=f"Set the owner of the output file (default: {FILE_OWNER})",
+    )
+    args = parser.parse_args()
+
+    root = os.path.abspath(args.source_directory)
+    if not os.path.isdir(root):
+        sys.exit(f"Error: '{args.source_directory}' is not a directory")
+
+    total = 0
+    missing_checksum = 0
+
+    print(args)
+    # Write the list to a temp. file and rename it once it is complete to stop incomplete dump files.
+    tmp_fd, TMP_FILE = tempfile.mkstemp(dir=os.path.dirname(args.output_dir))
+    with os.fdopen(tmp_fd, "w", encoding="utf-8") as out:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=args.follow_symlinks):
+            for name in filenames:
+                full_path = os.path.join(dirpath, name)
+
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError as e:
+                    print(f"Warning: could not get file size for {full_path}: {e}", file=sys.stderr)
+                    continue
+
+                checksum = get_checksum(full_path)
+                # print(f"checksum: {checksum}")
+                if checksum == "":
+                    missing_checksum += 1
+                    print(f"WARNING: no {XATTR_NAME} xattr on {full_path}", file=sys.stderr)
+
+                display_path = os.path.relpath(full_path, root) if args.relative else full_path
+
+                out.write(f"{display_path}\t{size}\t{checksum}\n")
+                total += 1
+
+    # The dump was done without errors.  Rename the temp. file and set the ownership.
+    file_name = os.path.join(args.output_dir,outputfile_name())
+    os.replace(TMP_FILE, file_name)
+    chown_file(file_name,args.owner)
+
+    print(f"Finished. {total} files written to '{file_name}' "
+          f"({missing_checksum} had no {XATTR_NAME} attribute).")
+
+
+if __name__ == "__main__":
+    main()
